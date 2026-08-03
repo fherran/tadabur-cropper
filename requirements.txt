@@ -1,0 +1,9 @@
+torch
+torchaudio
+soundfile
+numpy
+certifi
+transformers
+huggingface_hub
+recitations-segmenter
+matplotlib
