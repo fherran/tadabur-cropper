@@ -36,6 +36,48 @@ result = crop_ayahs("recitation.mp3", surah=19, ayah_start=1, ayah_end=18, out_d
 
 Ayah selection: pass `ayahs=[...]` for an explicit/non-contiguous list, `ayah_start`/`ayah_end` for a contiguous range, or neither for the whole surah.
 
+## Arguments, in plain words
+
+### `AyahAligner(...)` — one-time setup
+
+| Argument | What it means |
+|---|---|
+| `audio_model_path` | Where to load the audio embedding model from. Defaults to the public model on Hugging Face — downloads automatically. |
+| `ckpt_path` | Where to load the alignment checkpoint from. Defaults to `"auto"`, which downloads it automatically. |
+| `text_model_name` | Which text embedding model reads the verse text. Defaults to a general Arabic-capable model. |
+| `quality_floor` | How confident a match has to be before the tool trusts its own best guess. Lower = more results marked confident, but more likely to include mistakes. |
+| `fallback_floor` | A stricter version of `quality_floor`, used only when the tool couldn't anchor off the neighboring ayah and had to search the whole recording instead. |
+| `default_rate` | Seconds-per-character to assume when there's no real pacing data for an ayah. Fallback only. |
+| `min_dur` | The shortest a cropped ayah is allowed to be, in seconds — prevents absurdly tiny crops. |
+| `verbose` | Print progress messages while running. Set `False` for silent operation. |
+| `device` | Which hardware runs the embedding models (`"cpu"`, `"mps"`, `"cuda"`). Leave `None` to auto-detect the best available. |
+| `segmenter_device` | Same idea, just for the pause-detection model. Leave `None` to match `device`. |
+
+### `aligner.align(...)` — run it on one audio file
+
+| Argument | What it means |
+|---|---|
+| `audio_path` | Path to the audio file to crop. |
+| `surah` | Which surah (chapter) number this recitation is from. |
+| `ayahs` | An explicit list of ayah numbers to crop (e.g. `[1, 3, 7]`), instead of a simple range. |
+| `ayah_start` / `ayah_end` | Crop a continuous range of ayahs. Leave both out to crop the whole surah. |
+| `canon_text` | The official verse text, if you already have it. Leave `None` to fetch it automatically. |
+| `pace_hints` | Your own per-ayah pacing data, if you have it. Leave `None` to use the automatic data (recommended). |
+| `pairs_jsonl` | Where the automatic pacing data comes from. `"auto"` downloads it; `None` skips pacing calibration entirely (less accurate). |
+| `quran_api` | Where to fetch the official verse text from, if `canon_text` isn't given. |
+| `residual_max_span` | A safety limit, in seconds, on how long a "last resort" guess is allowed to be for ayahs the main search couldn't confidently place. Default 25s. |
+| `residual_max_run` | A safety limit on how many separate audio segments can be glued together into one of those last-resort guesses. Default 4. |
+
+### `crop_ayahs(...)` — one-shot shortcut
+
+Same `audio_path`/`surah`/`ayahs`/`ayah_start`/`ayah_end` as above, plus:
+
+| Argument | What it means |
+|---|---|
+| `out_dir` | Folder to save the cropped `.wav` files (and manifest) into. |
+| `aligner` | Reuse an already-created `AyahAligner` instead of loading the models again — faster when cropping many files. |
+| (any other keyword) | Passed straight through to `AyahAligner(...)` when it creates a new one. |
+
 ## How it works, briefly
 
 - Ayahs are resolved in number order. Each one tries a staged sequence of anchors — first the immediately-preceding confirmed ayah's end, then a global audio-text similarity search as a stricter fallback.
@@ -43,7 +85,7 @@ Ayah selection: pass `ayahs=[...]` for an explicit/non-contiguous list, `ayah_st
 - Every result carries a `confident` flag and `warnings`. **Ear-checking the output is the real ground truth this pipeline serves** — it narrows a full recording down to a short, mostly-correct list of candidates to verify, not a replacement for checking them.
 - Per-ayah pacing (`pace_hints`) is auto-downloaded and cached from a companion dataset on first use, so duration estimates are calibrated per-ayah rather than one flat rate for everything.
 
-The full design rationale (why each specific check exists, what real failure case it was built to catch) lives in the docstrings in `boundary_refine.py` and `ayah_aligner.py` — read those before changing scoring logic.
+The code itself is intentionally comment-light — see the arguments table above and the module-level docstrings at the top of `ayah_aligner.py`/`boundary_refine.py` for how to use it; read the source directly before changing scoring logic.
 
 ## 📄 Licenses
 

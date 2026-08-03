@@ -282,7 +282,7 @@ class AyahAligner:
             return t
         return (max(0.0, nudge(s, -1)), min(total, nudge(e, +1)))
 
-    def align(self, audio_path, surah, ayahs=None, ayah_start=None, ayah_end=None, canon_text=None, pace_hints=None, pairs_jsonl='auto', quran_api=DEFAULT_QURAN_API):
+    def align(self, audio_path, surah, ayahs=None, ayah_start=None, ayah_end=None, canon_text=None, pace_hints=None, pairs_jsonl='auto', quran_api=DEFAULT_QURAN_API, residual_max_span=25.0, residual_max_run=4):
         t0 = time.time()
         if canon_text is None:
             ctx = ssl.create_default_context(cafile=certifi.where())
@@ -384,9 +384,9 @@ class AyahAligner:
                 segs = br.get_segments(wave, total, glo, ghi, pad=8.0)
                 candidates_per_ayah = {ayah: [] for ayah in skipped}
                 for i in range(len(segs)):
-                    for j in range(i, min(i + 4, len(segs))):
+                    for j in range(i, min(i + residual_max_run, len(segs))):
                         a, b = (segs[i][0], segs[j][1])
-                        if b - a > 25:
+                        if b - a > residual_max_span:
                             break
                         for ayah in skipped:
                             sc = br.windowed_similarity(embed_clips, a, b, prep[ayah]['query'])
