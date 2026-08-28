@@ -551,10 +551,15 @@ class AyahCropper:
                         med, mad, tc2, tf2, own_refs = ta_verify.word_stamps(api, wave[:, int(lo * SR):int(hi * SR)], surah, ayah)
                         new_s, new_e = lo + med[0, 0], lo + med[-1, 1]
                         moved = []
-                        if mad[0, 0] <= 150 and abs(new_s - r['start']) > 0.08:
+                        r['_edge'] = (max(lo, new_s - 0.06) if mad[0, 0] <= 150 else None,
+                                      min(hi, new_e + 0.1) if mad[-1, 1] <= 150 else None)
+                        # shared boundaries are set by the joint pass below, not here
+                        start_shared = prev_r and prev_r['confident'] and 0 <= r['start'] - prev_r['end'] <= 2.0
+                        end_shared = next_r and next_r['confident'] and 0 <= next_r['start'] - r['end'] <= 2.0
+                        if not start_shared and mad[0, 0] <= 150 and abs(new_s - r['start']) > 0.08:
                             r['start'] = max(lo, new_s - 0.06)
                             moved.append('start')
-                        if mad[-1, 1] <= 150 and abs(new_e - r['end']) > 0.08:
+                        if not end_shared and mad[-1, 1] <= 150 and abs(new_e - r['end']) > 0.08:
                             r['end'] = min(hi, new_e + 0.1)
                             moved.append('end')
                         if moved:
@@ -579,6 +584,139 @@ class AyahCropper:
                     except Exception as ex:
                         r['warnings'] = r['warnings'] + ['refine_failed']
                         self._log(f'  ayah {ayah}: refine failed ({ex})')
+
+                # recovery first: (B) a weak-agreement neighbor probably
+                # swallowed the skipped ayah -> stitch the pair and split;
+                # then (A) fit remaining skipped ayahs into free gaps, best
+                # word-agreement per gap wins
+                for _round in range(3):
+                    progressed = False
+                    for ayah in ayahs:
+                        r = raw_results.get(ayah)
+                        prev_r = raw_results.get(ayah - 1)
+                        if not (r and not r['confident'] and prev_r and prev_r['confident'] and prev_r.get('refine_mad_ms', 0) > 250):
+                            continue
+                        try:
+                            lo2, hi2 = prev_r['start'], min(total, prev_r['end'] + 0.3)
+                            med, mad, splits, smad = ta_verify.stitched_stamps(api, wave[:, int(lo2 * SR):int(hi2 * SR)], surah, [ayah - 1, ayah])
+                            split = lo2 + splits[0]
+                            if smad[0] <= 300 and lo2 + 0.5 < split < hi2 - 0.5:
+                                old_end = prev_r['end']
+                                prev_r['end'] = split
+                                prev_r['refine_mad_ms'] = round(float(mad.mean()), 1)
+                                prev_r['warnings'] = prev_r['warnings'] + [f'shrunk_gave_tail_to_{ayah}']
+                                e2 = min(hi2, lo2 + med[-1, 1] + 0.1)
+                                raw_results[ayah] = {'method': 'recovered_neighbor_split', 'start': split, 'end': e2, 'sc': r.get('sc', 0.0), 'open_score': 0.0, 'close_score': 0.0, 'confident': True, 'warnings': ['recovered_from_neighbor_split_verify_by_ear'], 'refine_mad_ms': round(float(mad.mean()), 1), '_end_capped': e2 >= hi2 - 0.12}
+                                self._log(f'  ayah {ayah}: RECOVERED from inside ayah {ayah - 1} -- split at {split:.2f}s (neighbor end was {old_end:.2f})')
+                                progressed = True
+                        except Exception as ex:
+                            self._log(f'  ayah {ayah}: neighbor-split recovery failed ({ex})')
+                    windows = {}
+                    for ayah in ayahs:
+                        r = raw_results.get(ayah)
+                        if r and not r['confident']:
+                            lower, upper = order_bounds(ayah)
+                            if upper - lower >= 1.0:
+                                windows.setdefault((round(lower, 2), round(upper, 2)), []).append(ayah)
+                    for (wl, wu), cands in windows.items():
+                        best = None
+                        for ayah in cands:
+                            try:
+                                lo2, hi2 = max(0.0, wl), min(total, wu)
+                                med, mad, tc2, tf2, own_refs = ta_verify.word_stamps(api, wave[:, int(lo2 * SR):int(hi2 * SR)], surah, ayah)
+                                if mad.mean() <= 250 and (best is None or mad.mean() < best[1]):
+                                    best = (ayah, float(mad.mean()), med, lo2, hi2)
+                            except Exception:
+                                pass
+                        if best is not None:
+                            ayah, m, med, lo2, hi2 = best
+                            s2 = max(lo2, lo2 + med[0, 0] - 0.06)
+                            e2 = min(hi2, lo2 + med[-1, 1] + 0.1)
+                            raw_results[ayah] = {'method': 'recovered_gap_words', 'start': s2, 'end': e2, 'sc': raw_results[ayah].get('sc', 0.0), 'open_score': 0.0, 'close_score': 0.0, 'confident': True, 'warnings': ['recovered_word_alignment_verify_by_ear'], 'refine_mad_ms': round(m, 1), '_start_capped': s2 <= lo2 + 0.08, '_end_capped': e2 >= hi2 - 0.12}
+                            self._log(f'  ayah {ayah}: RECOVERED in gap [{s2:.2f},{e2:.2f}] (word agreement {m:.0f}ms, {len(cands)} candidate(s))')
+                            progressed = True
+                    if not progressed:
+                        break
+
+                # then stitch each chain of adjacent confident ayahs in ONE
+                # alignment; uncertain chain splits fall back to the per-ayah
+                # word grids from phase 1
+                chains, cur = [], []
+                for ayah in ayahs:
+                    r = raw_results.get(ayah)
+                    if r and r['confident'] and cur and ayah == cur[-1] + 1 and -0.2 <= r['start'] - raw_results[cur[-1]]['end'] <= 2.0:
+                        cur.append(ayah)
+                    elif r and r['confident']:
+                        if len(cur) > 1:
+                            chains.append(cur)
+                        cur = [ayah]
+                    else:
+                        if len(cur) > 1:
+                            chains.append(cur)
+                        cur = []
+                if len(cur) > 1:
+                    chains.append(cur)
+                for chain in chains:
+                    try:
+                        r_first, r_last = raw_results[chain[0]], raw_results[chain[-1]]
+                        lower, _ = order_bounds(chain[0])
+                        _, upper = order_bounds(chain[-1])
+                        lo = max(0.0, lower, r_first['start'] - 0.8)
+                        hi = min(total, max(upper, r_last['end']), r_last['end'] + 0.8)
+                        med, mad, splits, smad = ta_verify.stitched_stamps(api, wave[:, int(lo * SR):int(hi * SR)], surah, chain)
+                        prev_n = raw_results.get(chain[0] - 1)
+                        next_n = raw_results.get(chain[-1] + 1)
+                        if mad[0, 0] <= 150:
+                            s_new = max(lo, lo + med[0, 0] - 0.06)
+                            if prev_n:
+                                s_new = max(s_new, min(r_first['start'], prev_n['end']))
+                            r_first['start'] = s_new
+                        if mad[-1, 1] <= 150:
+                            e_new = min(hi, lo + med[-1, 1] + 0.1)
+                            if next_n:
+                                e_new = min(e_new, max(r_last['end'], next_n['start']))
+                            r_last['end'] = e_new
+                        for k, sp in enumerate(splits):
+                            aa, bb = chain[k], chain[k + 1]
+                            ra, rb = raw_results[aa], raw_results[bb]
+                            pa = (ra.get('_edge') or (None, None))[1]
+                            pb = (rb.get('_edge') or (None, None))[0]
+                            cands_ = []
+                            if smad[k] <= 150:
+                                cands_.append((lo + sp, 'chain'))
+                            else:
+                                try:
+                                    lo_p, hi_p = ra['start'], rb['end']
+                                    _, _, sp_p, smad_p = ta_verify.stitched_stamps(api, wave[:, int(lo_p * SR):int(hi_p * SR)], surah, [aa, bb])
+                                    if smad_p[0] <= 150:
+                                        cands_.append((lo_p + sp_p[0], 'pair'))
+                                except Exception:
+                                    pass
+                            if pa is not None and pb is not None and abs(pa - pb) <= 0.3:
+                                cands_.append(((pa + pb) / 2, 'per-ayah'))
+                            elif pb is not None:
+                                cands_.append((pb, 'per-ayah start'))
+                            elif pa is not None:
+                                cands_.append((pa, 'per-ayah end'))
+                            # a real pause between the pair (narrow gap) is strong
+                            # evidence: the split may not wander far from it
+                            gap0, gap1 = ra['end'], rb['start']
+                            tight = gap1 - gap0 < 1.0 and not (ra.get('_end_capped') or rb.get('_start_capped'))
+                            split, src_ = None, ''
+                            for cand, name in cands_:
+                                if tight and not gap0 - 0.3 <= cand <= gap1 + 0.3:
+                                    continue
+                                split, src_ = cand, name
+                                break
+                            if split is not None and ra['start'] + 0.5 < split < rb['end'] - 0.5:
+                                old_b = (ra['end'], rb['start'])
+                                ra['end'] = split
+                                rb['start'] = split
+                                self._log(f'  boundary {aa}|{bb}: split at {split:.2f}s via {src_} (was {old_b[0]:.2f}|{old_b[1]:.2f}, chain spread {smad[k]:.0f}ms)')
+                            else:
+                                ra['warnings'] = ra['warnings'] + ['shared_boundary_unrefined_verify_by_ear']
+                    except Exception as ex:
+                        self._log(f'  chain {chain[0]}-{chain[-1]}: joint refine failed ({ex})')
 
         entries = []
         for ayah in ayahs:
