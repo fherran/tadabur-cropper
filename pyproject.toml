@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tadabur-cropper"
+version = "0.1.0"
+description = "Crop individual ayahs out of a Quran recitation recording - audio-text embedding search with reference-based verification"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Faisal Alherran" }]
+keywords = ["quran", "speech", "audio", "segmentation", "cropping"]
+dependencies = [
+    "torch>=2.1",
+    "torchaudio>=2.1",
+    "transformers>=4.40",
+    "numpy>=1.24",
+    "soundfile>=0.12",
+    "certifi",
+    "huggingface_hub",
+    "recitations-segmenter",
+    "tadabur-align @ git+https://github.com/FaisaI/tadabur-align",
+]
+
+[project.urls]
+Homepage = "https://github.com/fherran/tadabur-cropper"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tadabur_cropper"]

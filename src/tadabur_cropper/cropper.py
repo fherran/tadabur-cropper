@@ -1,8 +1,8 @@
 """Crop ayahs out of a recitation recording: audio-text embedding search,
 plus reference-based boundary refinement and mutashabihat verification.
 
-    from ayah_aligner import AyahAligner
-    result = AyahAligner().align("rec.mp3", surah=26, ayah_start=160, ayah_end=163)
+    from tadabur_cropper import AyahCropper
+    result = AyahCropper().align("rec.mp3", surah=26, ayah_start=160, ayah_end=163)
     result.save("out/")
 """
 import json
@@ -19,7 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 import soundfile as sf
-import boundary_refine as br
+from . import boundary_refine as br
 SR = 16000
 DEFAULT_TEXT_MODEL_NAME = 'jhu-clsp/mmBERT-base'
 DEFAULT_QURAN_API = 'https://quranapi.pages.dev/api/{surah}.json'
@@ -105,7 +105,7 @@ class AyahResult:
     def duration_s(self):
         return None if self.start_s is None else round(self.end_s - self.start_s, 3)
 
-class AlignmentResult:
+class CropResult:
 
     def __init__(self, entries, wave, sr, surah, source_path):
         self.entries = entries
@@ -177,7 +177,7 @@ class AlignmentResult:
             json.dump(self.to_manifest(), f, ensure_ascii=False, indent=2)
         return out_dir
 
-class AyahAligner:
+class AyahCropper:
 
     def __init__(self, audio_model_path=DEFAULT_AUDIO_MODEL_PATH, ckpt_path=DEFAULT_CKPT_PATH, text_model_name=DEFAULT_TEXT_MODEL_NAME, quality_floor=0.45, fallback_floor=0.75, default_rate=0.2, min_dur=0.4, verbose=True, device=None, segmenter_device=None):
         from transformers import AutoModel, AutoTokenizer
@@ -203,7 +203,7 @@ class AyahAligner:
         if ckpt_path == 'auto':
             ckpt_path = _hf_download(CKPT_REPO, CKPT_FILENAME, 'model', 'checkpoint')
             if ckpt_path is None:
-                raise RuntimeError('could not auto-download the alignment checkpoint -- pass ckpt_path= explicitly to AyahAligner() with a local .pt file instead')
+                raise RuntimeError('could not auto-download the alignment checkpoint -- pass ckpt_path= explicitly to AyahCropper() with a local .pt file instead')
         ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
 
         class ProjectionHead(nn.Module):
@@ -591,10 +591,10 @@ class AyahAligner:
         self._log(f'done: {n_conf}/{len(ayahs)} confident  (total {time.time() - t0:.1f}s)')
         if skipped:
             self._log(f'needs manual attention: {skipped}')
-        return AlignmentResult(entries, wave, SR, surah, audio_path)
+        return CropResult(entries, wave, SR, surah, audio_path)
 
 def crop_ayahs(audio_path, surah, ayahs=None, ayah_start=None, ayah_end=None, out_dir=None, aligner=None, **aligner_kwargs):
-    aligner = aligner or AyahAligner(**aligner_kwargs)
+    aligner = aligner or AyahCropper(**aligner_kwargs)
     result = aligner.align(audio_path, surah, ayahs=ayahs, ayah_start=ayah_start, ayah_end=ayah_end)
     if out_dir:
         result.save(out_dir)
