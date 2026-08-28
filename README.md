@@ -25,7 +25,7 @@ Or keep the models loaded across many files:
 ```python
 from tadabur_cropper import AyahCropper
 
-cropper = AyahCropper()                          # loads models once
+cropper = AyahCropper(device="cuda")             # loads models once; or device="cpu" (None auto-detects)
 result = cropper.align("recitation.mp3", surah=19, ayah_start=1, ayah_end=18)
 result.save("out/")
 ```
