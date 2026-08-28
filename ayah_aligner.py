@@ -1,52 +1,9 @@
-"""High-level API for the ayah alignment pipeline.
+"""Crop ayahs out of a recitation recording: audio-text embedding search,
+plus reference-based boundary refinement and mutashabihat verification.
 
     from ayah_aligner import AyahAligner
-
-    aligner = AyahAligner()                       # loads models ONCE
-    result = aligner.align(audio_path, surah=16, ayahs=range(1, 19))
-    result.save(out_dir)                          # writes manifest.json + .wav + figure per ayah
-
-    for entry in result:
-        print(entry.ayah, entry.confident, entry.start_s, entry.end_s)
-
-Or, for one-shot use:
-
-    from ayah_aligner import crop_ayahs
-    result = crop_ayahs(audio_path, surah=16, ayahs=range(1, 19), out_dir=out_dir)
-
-This is a thin, reusable wrapper around the actual algorithm, which lives in
-boundary_refine.py (resolve_ayah, segment_run_candidates, windowed_similarity,
-get_segments, finalize_start/end) and is unchanged from crop_pipeline.py --
-only the packaging is new. See boundary_refine.resolve_ayah()'s docstring for
-the reasoning behind each design choice; in short:
-
-  - Ayahs are processed in NUMBER order (not confidence order), since most
-    reciters go sequentially most of the time.
-  - Each ayah tries STAGED anchor attempts, never pooled: (1) the immediately
-    preceding CONFIRMED ayah's end, then (2) a global chunk-similarity
-    search, which needs a STRICTER score to confirm since a global search
-    can land on a region that plausibly matches several different ayahs'
-    text at once.
-  - Candidates are real-pause segment-runs first, a fixed-window fallback
-    only when no real pause exists nearby.
-  - Length is chosen by scoring every plausible run length up front plus a
-    duration-over-estimate penalty -- there is deliberately no post-hoc
-    "extend if uncertain" step (three variants of one were tried and each
-    ran away into a multi-ayah span at least once).
-  - Anything that clears neither attempt is skipped, not forced, then
-    retried in a RESIDUAL PASS once every other ayah is confirmed: real
-    unclaimed time gaps are computed and every skipped ayah is scored
-    against real segments specifically inside them.
-  - Every result carries an explicit `confident` flag and `warnings` --
-    nothing is silently presented as correct. Ear verification against the
-    saved crop is still the real ground truth this pipeline serves; it
-    narrows a whole recording down to a short, trustworthy list of
-    candidates to check, not a replacement for checking them.
-
-Validated end-to-end on one 18-ayah, non-sequential recitation: 18/18
-matching a fully hand-verified, ear-checked ground truth. See this module's
-`align()` docstring for what is and isn't expected to generalize as-is to a
-different recording, reciter, or embedding model.
+    result = AyahAligner().align("rec.mp3", surah=26, ayah_start=160, ayah_end=163)
+    result.save("out/")
 """
 import json
 import os
@@ -72,6 +29,18 @@ CKPT_REPO = 'FaisaI/tadabur-embedding'
 CKPT_FILENAME = 'checkpoint_last.pt'
 PAIRS_JSONL_REPO = 'FaisaI/tadabur-align-references'
 PAIRS_JSONL_FILENAME = 'aligner_pairs.jsonl'
+MUTASHABIHAT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mutashabihat', 'mutashabihat.json')
+_mutashabihat_cache = None
+
+def _load_mutashabihat():
+    global _mutashabihat_cache
+    if _mutashabihat_cache is None:
+        try:
+            with open(MUTASHABIHAT_PATH, encoding='utf-8') as f:
+                _mutashabihat_cache = json.load(f)
+        except OSError:
+            _mutashabihat_cache = {}
+    return _mutashabihat_cache
 
 def _hf_download(repo_id, filename, repo_type, what):
     try:
@@ -86,6 +55,19 @@ def _download_default_pairs_jsonl():
     if path is None:
         print('falling back to flat default rate', flush=True)
     return path
+
+def _word_overlap(text_a, text_b):
+    """Shared words / shorter text's word count (bag overlap)."""
+    wa, wb = text_a.split(), text_b.split()
+    if not wa or not wb:
+        return 0.0
+    remaining, shared = list(wb), 0
+    for w in wa:
+        if w in remaining:
+            remaining.remove(w)
+            shared += 1
+    return shared / min(len(wa), len(wb))
+
 
 def _auto_pace_hints(pairs_jsonl, surah, ayahs):
     by_ayah = {}
@@ -117,6 +99,7 @@ class AyahResult:
     close_score: float
     warnings: list = field(default_factory=list)
     audio_filename: Optional[str] = None
+    refine_mad_ms: Optional[float] = None
 
     @property
     def duration_s(self):
@@ -166,12 +149,15 @@ class AlignmentResult:
             matplotlib.use('Agg')
             import matplotlib.pyplot as plt
         total = self._wave.shape[1] / self._sr
+        # slice crops from the original file, not the 16kHz working copy
+        src_wav, src_sr = sf.read(self.source_path, dtype='float32', always_2d=True)
         for e in self.entries:
             if not e.confident:
                 continue
             filename = f'S{self.surah}_A{e.ayah:03d}.wav'
             s, en = (e.start_s, e.end_s)
-            sf.write(os.path.join(out_dir, filename), self._wave[0, int(s * self._sr):int(en * self._sr)].numpy(), self._sr)
+            crop = src_wav[int(s * src_sr):int(en * src_sr)]
+            sf.write(os.path.join(out_dir, filename), crop, src_sr)
             e.audio_filename = filename
             if with_figures:
                 fig, ax = plt.subplots(figsize=(11, 3.2))
@@ -200,6 +186,7 @@ class AyahAligner:
         self.default_rate = default_rate
         self.min_dur = min_dur
         self.verbose = verbose
+        self._refiner = None
         if torch.cuda.is_available():
             torch.backends.cuda.matmul.allow_tf32 = False
             torch.backends.cudnn.allow_tf32 = False
@@ -282,7 +269,18 @@ class AyahAligner:
             return t
         return (max(0.0, nudge(s, -1)), min(total, nudge(e, +1)))
 
-    def align(self, audio_path, surah, ayahs=None, ayah_start=None, ayah_end=None, canon_text=None, pace_hints=None, pairs_jsonl='auto', quran_api=DEFAULT_QURAN_API, residual_max_span=25.0, residual_max_run=4):
+    def _windowed_scores(self, embed_clips, s, e, queries):
+        """windowed_similarity scoring for many queries, one embedding pass."""
+        if e - s <= 10.2:
+            embs = embed_clips([(s, e)])
+            return [float((embs @ q)[0]) for q in queries]
+        starts = list(np.arange(s, e - 10.0 + 1e-06, 5.0)) or [s]
+        if starts[-1] + 10.0 < e:
+            starts.append(e - 10.0)
+        embs = embed_clips([(a, min(e, a + 10.0)) for a in starts])
+        return [float((embs @ q).max()) for q in queries]
+
+    def align(self, audio_path, surah, ayahs=None, ayah_start=None, ayah_end=None, canon_text=None, pace_hints=None, pairs_jsonl='auto', quran_api=DEFAULT_QURAN_API, residual_max_span=60.0, residual_max_run=10, mask_fatiha=True, decoy_margin=0.35, refine=True):
         t0 = time.time()
         if canon_text is None:
             ctx = ssl.create_default_context(cafile=certifi.where())
@@ -342,12 +340,68 @@ class AyahAligner:
             exp_dur = min(exp_dur_raw, 10.24)
             query = self._embed_text(text)
             prep[ayah] = {'text': text, 'exp_dur': exp_dur, 'exp_dur_raw': exp_dur_raw, 'query': query}
+        # in-request rivals, logged only; never arbitrate by embedding score
+        # (tried, noise) -- the word duel in refine is the real check
+        confusable = {ayah: set() for ayah in ayahs}
+        for i, a1 in enumerate(ayahs):
+            for a2 in ayahs[i + 1:]:
+                if _word_overlap(prep[a1]['text'], prep[a2]['text']) >= 0.8:
+                    confusable[a1].add(a2)
+                    confusable[a2].add(a1)
+        n_confusable = sum(1 for v in confusable.values() if v)
+        if n_confusable:
+            self._log(f'  {n_confusable}/{len(ayahs)} ayahs have a textually confusable rival in this request')
+        # prayer recordings recite al-Fatiha mid-file; reject spans matching
+        # it decisively better than the requested ayah
+        decoy_queries = []
+        if mask_fatiha and surah != 1:
+            try:
+                ctx = ssl.create_default_context(cafile=certifi.where())
+                req = urllib.request.Request(quran_api.format(surah=1), headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
+                    fatiha_texts = json.loads(r.read().decode())['arabic2']
+                decoy_queries = [self._embed_text(t) for t in fatiha_texts]
+                self._log(f'  fatiha decoys: {len(decoy_queries)} ayahs embedded (spans matching al-Fatiha decisively better than the requested ayah are rejected)')
+            except Exception as ex:
+                self._log(f'  fatiha decoys unavailable ({ex}) -- proceeding without')
+
+        def decoy_check(s, e, own_query):
+            """(hit, own_sc, best_decoy_sc); decoys also scored on ~3s sub-windows."""
+            if not decoy_queries:
+                return (False, 0.0, 0.0)
+            own = self._windowed_scores(embed_clips, s, e, [own_query])[0]
+            sub = [(s, e)] if e - s <= 3.5 else []
+            t = s
+            while t + 2.0 < e:
+                sub.append((t, min(e, t + 3.0)))
+                t += 1.5
+            embs = embed_clips(sub)
+            best_decoy = max(float((embs @ dq).max()) for dq in decoy_queries)
+            return (best_decoy - own > decoy_margin, own, best_decoy)
         claimed_mask = np.zeros(len(chunk_centers), dtype=bool)
         raw_results = {}
         skipped = []
+        # actual/predicted duration ratios: this reciter's observed pace
+        pace_ratios = []
 
         def confirmed_spans():
             return [(r['start'], r['end']) for r in raw_results.values() if r['confident']]
+
+        def order_bounds(ayah):
+            """Valid time window for this ayah given confirmed numeric neighbors."""
+            lower = 0.0
+            for a in range(ayah - 1, min(ayahs) - 1, -1):
+                r = raw_results.get(a)
+                if r and r['confident']:
+                    lower = r['end']
+                    break
+            upper = total
+            for a in range(ayah + 1, max(ayahs) + 1):
+                r = raw_results.get(a)
+                if r and r['confident']:
+                    upper = r['start']
+                    break
+            return (lower, upper)
         for ayah in ayahs:
             p = prep[ayah]
             text, query, exp_dur, exp_dur_raw = (p['text'], p['query'], p['exp_dur'], p['exp_dur_raw'])
@@ -356,69 +410,183 @@ class AyahAligner:
             if prev and prev['confident']:
                 anchor_groups.append([prev['end']])
             anchor_groups.append(top_peaks(query, 3, claimed_mask, min_sep=max(3.0, exp_dur)))
+            # decoys stay OUT of other_queries (segment-level margins are noise);
+            # finished spans only
             other_queries = [prep[a]['query'] for a in ayahs if a != ayah]
             result = br.resolve_ayah(text, query, wave, total, self._embed_text, embed_clips, anchor_groups, exp_dur, exp_dur_raw, confirmed_spans(), quality_floor=self.quality_floor, fallback_floor=self.fallback_floor, other_queries=other_queries)
             s, e = self._snap_to_silence(wave, total, br.finalize_start(wave, total, result['start'], result['end']), result['end'])
             e = br.finalize_end(wave, total, s, e)
             s, e = self._snap_to_silence(wave, total, s, e)
             result['start'], result['end'] = (s, e)
+            if result['confident'] and decoy_queries:
+                hit, own_sc, best_decoy = decoy_check(s, e, query)
+                if hit:
+                    result['confident'] = False
+                    result['warnings'] = result['warnings'] + ['span_matches_fatiha_decoy_better']
+                    self._log(f'  ayah {ayah}: REJECTED -- span [{s:.2f},{e:.2f}] matches al-Fatiha decisively better ({best_decoy:.3f} vs own {own_sc:.3f}); likely the prayer\'s Fatiha, not this ayah')
             raw_results[ayah] = result
             if result['confident']:
                 claimed_mask |= (chunk_centers >= s - 0.5) & (chunk_centers <= e + 0.5)
+                pace_ratios.append((e - s) / exp_dur_raw)
             else:
                 skipped.append(ayah)
             self._log(f"  ayah {ayah:2d}: [{s:6.2f},{e:6.2f}] ({e - s:5.2f}s) {result['method']:14s} sc={result['sc']:.3f} open={result['open_score']:.3f} close={result['close_score']:.3f}  {('CONFIDENT' if result['confident'] else 'SKIPPED: ' + ','.join(result['warnings']))}")
+
+        # demote spans that contradict the Quran's fixed ayah order;
+        # looped to a fixpoint since one demotion can expose another
+        changed, rounds = True, 0
+        while changed and rounds < 5:
+            changed, rounds = False, rounds + 1
+            for ayah in sorted(ayahs):
+                r = raw_results[ayah]
+                if not r['confident']:
+                    continue
+                lower, upper = order_bounds(ayah)
+                if r['start'] < lower - 0.5 or r['end'] > upper + 0.5:
+                    self._log(f'  ayah {ayah}: DEMOTED -- [{r["start"]:.2f},{r["end"]:.2f}] contradicts ayah sequence '
+                               f'order (must fall within [{lower:.2f},{upper:.2f}] given other confirmed ayahs); deferring to residual pass')
+                    r['confident'] = False
+                    r['warnings'] = r['warnings'] + ['demoted_violates_ayah_sequence_order']
+                    skipped.append(ayah)
+                    changed = True
 
         def _accept_residual(ayah, s0, e0, sc, warning):
             s, e = self._snap_to_silence(wave, total, br.finalize_start(wave, total, s0, e0), e0)
             e = br.finalize_end(wave, total, s, e)
             s, e = self._snap_to_silence(wave, total, s, e)
             o, c = br.edge_match_scores(self._embed_text, embed_clips, prep[ayah]['text'], s, e)
-            raw_results[ayah] = {'method': 'residual_gap', 'start': s, 'end': e, 'sc': sc, 'open_score': o, 'close_score': c, 'confident': True, 'warnings': [warning]}
-            self._log(f'  RESOLVED ayah {ayah} at [{s:.2f},{e:.2f}] sc={sc:.3f} ({warning})')
+            # residual matches are global-search class: confident only above
+            # fallback_floor, else kept as a flagged guess
+            prev = raw_results.get(ayah)
+            if prev and prev.get('method') == 'residual_gap' and prev['sc'] >= sc:
+                return prev['confident']
+            warnings = [warning]
+            decoy_hit, _, _ = decoy_check(s, e, prep[ayah]['query'])
+            if decoy_hit:
+                warnings.append('span_matches_fatiha_decoy_better')
+            confident = sc >= self.fallback_floor and not decoy_hit
+            if not confident and not decoy_hit:
+                warnings.append('below_fallback_floor_verify_by_ear')
+            raw_results[ayah] = {'method': 'residual_gap', 'start': s, 'end': e, 'sc': sc, 'open_score': o, 'close_score': c, 'confident': confident, 'warnings': warnings}
+            self._log(f'  {"RESOLVED" if confident else "GUESSED (unverified)"} ayah {ayah} at [{s:.2f},{e:.2f}] sc={sc:.3f} ({",".join(warnings)})')
+            return confident
         if skipped:
+            observed_pace = float(np.median(pace_ratios)) if pace_ratios else 1.0
+            self._log(f'  residual pass: observed pace {observed_pace:.2f}x pace_hints prediction (from {len(pace_ratios)} confirmed ayahs so far)')
             gaps = br.find_gaps(confirmed_spans(), total)
             self._log(f'  residual pass: {len(skipped)} skipped, {len(gaps)} unclaimed gaps')
             all_best = {}
             for glo, ghi in gaps:
                 segs = br.get_segments(wave, total, glo, ghi, pad=8.0)
                 candidates_per_ayah = {ayah: [] for ayah in skipped}
+                # caps are backstops; the real bound is the pace-scaled soft penalty
                 for i in range(len(segs)):
                     for j in range(i, min(i + residual_max_run, len(segs))):
                         a, b = (segs[i][0], segs[j][1])
                         if b - a > residual_max_span:
                             break
                         for ayah in skipped:
+                            # never score a span outside the ayah's order window
+                            lower, upper = order_bounds(ayah)
+                            if a < lower - 0.5 or b > upper + 0.5:
+                                continue
                             sc = br.windowed_similarity(embed_clips, a, b, prep[ayah]['query'])
                             candidates_per_ayah[ayah].append((sc, a, b))
                 best_per_ayah = {}
                 for ayah, cands in candidates_per_ayah.items():
                     if not cands:
                         continue
-                    top = max((c[0] for c in cands))
-                    close = [c for c in cands if c[0] >= top - 0.03]
-                    sc, a, b = min(close, key=lambda c: c[2] - c[1])
+                    ref_dur = prep[ayah]['exp_dur_raw'] * observed_pace
+
+                    def penalized(c, ref_dur=ref_dur):
+                        sc, a, b = c
+                        over = max(0.0, b - a - 1.4 * ref_dur)
+                        return sc - over / max(ref_dur, 3.0) * 0.6
+                    top = max((penalized(c) for c in cands))
+                    close = [c for c in cands if penalized(c) >= top - 0.03]
+                    non_overlapping = [c for c in close if not br.overlaps_any(c[1], c[2], confirmed_spans())]
+                    sc, a, b = max(non_overlapping or close, key=lambda c: c[2] - c[1])
                     best_per_ayah[ayah] = (sc, a, b)
                 for ayah, (sc, a, b) in best_per_ayah.items():
                     if ayah not in all_best or sc > all_best[ayah][0]:
                         all_best[ayah] = (sc, a, b)
                     if sc > 0.3 and (not br.overlaps_any(a, b, confirmed_spans())):
-                        _accept_residual(ayah, a, b, sc, 'found_via_residual_gap_pass')
-                        skipped.remove(ayah)
+                        if _accept_residual(ayah, a, b, sc, 'found_via_residual_gap_pass'):
+                            skipped.remove(ayah)
             if len(skipped) == 1:
                 ayah = skipped[0]
                 if ayah in all_best:
                     sc, a, b = all_best[ayah]
                     if not br.overlaps_any(a, b, confirmed_spans()):
-                        _accept_residual(ayah, a, b, sc, 'resolved_by_elimination_last_remaining_ayah')
-                        skipped.remove(ayah)
+                        if _accept_residual(ayah, a, b, sc, 'resolved_by_elimination_last_remaining_ayah'):
+                            skipped.remove(ayah)
+        # Boundary refinement: word timestamps transferred from reference
+        # recitations (tadabur-align) replace loudness-based edges.
+        if refine:
+            api = None
+            try:
+                from tadabur_align import WordTimestamps
+                from tadabur_align import verify as ta_verify
+                if self._refiner is None:
+                    self._refiner = WordTimestamps(device=self.device)
+                api = self._refiner
+            except Exception as ex:
+                self._log(f'  refine skipped ({ex})')
+            DUEL_MARGIN = 0.08
+
+            if api is not None:
+                for ayah in ayahs:
+                    r = raw_results.get(ayah)
+                    if not (r and r['confident']):
+                        continue
+                    try:
+                        lower, upper = order_bounds(ayah)
+                        prev_r, next_r = raw_results.get(ayah - 1), raw_results.get(ayah + 1)
+                        if prev_r and prev_r['end'] <= r['start'] + 0.1:
+                            lower = max(lower, prev_r['end'])
+                        if next_r and next_r['start'] >= r['end'] - 0.1:
+                            upper = min(upper, next_r['start'])
+                        lo = max(0.0, lower, r['start'] - 0.8)
+                        hi = min(total, max(upper, r['end']), r['end'] + 0.8)
+                        med, mad, tc2, tf2, own_refs = ta_verify.word_stamps(api, wave[:, int(lo * SR):int(hi * SR)], surah, ayah)
+                        new_s, new_e = lo + med[0, 0], lo + med[-1, 1]
+                        moved = []
+                        if mad[0, 0] <= 150 and abs(new_s - r['start']) > 0.08:
+                            r['start'] = max(lo, new_s - 0.06)
+                            moved.append('start')
+                        if mad[-1, 1] <= 150 and abs(new_e - r['end']) > 0.08:
+                            r['end'] = min(hi, new_e + 0.1)
+                            moved.append('end')
+                        if moved:
+                            r['start'], r['end'] = self._snap_to_silence(wave, total, r['start'], r['end'])
+                            self._log(f'  ayah {ayah}: refined {"+".join(moved)} -> [{r["start"]:.2f},{r["end"]:.2f}] (word agreement {mad.mean():.0f}ms)')
+                        r['refine_mad_ms'] = round(float(mad.mean()), 1)
+                        if mad.mean() > 250:
+                            r['warnings'] = r['warnings'] + ['weak_word_agreement_verify_by_ear']
+                        verdicts = ta_verify.word_duel(api, med, tc2, tf2, own_refs, _load_mutashabihat().get(f'{surah}:{ayah}', {}))
+                        if verdicts:
+                            worst = min(verdicts, key=lambda v: v[2] - v[1])
+                            rk, own_c, riv_c = worst
+                            if riv_c + DUEL_MARGIN < own_c:
+                                r['confident'] = False
+                                r['warnings'] = r['warnings'] + [f'differing_word_matches_rival_{rk}']
+                                self._log(f'  ayah {ayah}: REJECTED by word duel -- audio matches ayah {rk} better ({riv_c:.3f} vs own {own_c:.3f})')
+                            elif own_c + DUEL_MARGIN < riv_c:
+                                self._log(f'  ayah {ayah}: word duel verified vs {len(verdicts)} rival(s) (own {own_c:.3f} vs best rival {riv_c:.3f})')
+                            else:
+                                r['warnings'] = r['warnings'] + ['differing_word_duel_inconclusive_verify_by_ear']
+                                self._log(f'  ayah {ayah}: word duel inconclusive vs {rk} ({riv_c:.3f} vs own {own_c:.3f}) -- verify by ear')
+                    except Exception as ex:
+                        r['warnings'] = r['warnings'] + ['refine_failed']
+                        self._log(f'  ayah {ayah}: refine failed ({ex})')
+
         entries = []
         for ayah in ayahs:
             r = raw_results.get(ayah)
             if r is None:
                 entries.append(AyahResult(ayah, prep[ayah]['text'], None, None, False, 'none', 0.0, 0.0, 0.0, ['not_processed']))
             else:
-                entries.append(AyahResult(ayah, prep[ayah]['text'], round(r['start'], 3), round(r['end'], 3), r['confident'], r['method'], round(r['sc'], 4), round(r['open_score'], 4), round(r['close_score'], 4), r['warnings']))
+                entries.append(AyahResult(ayah, prep[ayah]['text'], round(r['start'], 3), round(r['end'], 3), r['confident'], r['method'], round(r['sc'], 4), round(r['open_score'], 4), round(r['close_score'], 4), r['warnings'], refine_mad_ms=r.get('refine_mad_ms')))
         n_conf = sum((1 for e in entries if e.confident))
         self._log(f'done: {n_conf}/{len(ayahs)} confident  (total {time.time() - t0:.1f}s)')
         if skipped:

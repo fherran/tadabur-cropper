@@ -65,8 +65,11 @@ Ayah selection: pass `ayahs=[...]` for an explicit/non-contiguous list, `ayah_st
 | `pace_hints` | Your own per-ayah pacing data, if you have it. Leave `None` to use the automatic data (recommended). |
 | `pairs_jsonl` | Where the automatic pacing data comes from. `"auto"` downloads it; `None` skips pacing calibration entirely (less accurate). |
 | `quran_api` | Where to fetch the official verse text from, if `canon_text` isn't given. |
-| `residual_max_span` | A safety limit, in seconds, on how long a "last resort" guess is allowed to be for ayahs the main search couldn't confidently place. Default 25s. |
-| `residual_max_run` | A safety limit on how many separate audio segments can be glued together into one of those last-resort guesses. Default 4. |
+| `residual_max_span` | A generous backstop, in seconds, on how long a "last resort" guess is allowed to be. The real bound is now adaptive (the reciter's own observed pace). Default 60s. |
+| `residual_max_run` | Backstop on how many separate audio segments can be glued into one last-resort guess. Default 10. |
+| `mask_fatiha` | Prayer recordings recite al-Fatiha mid-file; spans matching it decisively better than the requested ayah are rejected. Default on. |
+| `decoy_margin` | How decisively al-Fatiha must win before a span is rejected. Default 0.35. |
+| `refine` | Polish every confident crop's boundaries with word timestamps from reference recitations ([tadabur-align](https://github.com/FaisaI/tadabur-align)), and verify mutashabihat ayahs by dueling the differing word's audio against each rival's references. Default on; skipped gracefully if tadabur-align isn't installed. |
 
 ### `crop_ayahs(...)` — one-shot shortcut
 
@@ -77,6 +80,17 @@ Same `audio_path`/`surah`/`ayahs`/`ayah_start`/`ayah_end` as above, plus:
 | `out_dir` | Folder to save the cropped `.wav` files (and manifest) into. |
 | `aligner` | Reuse an already-created `AyahAligner` instead of loading the models again — faster when cropping many files. |
 | (any other keyword) | Passed straight through to `AyahAligner(...)` when it creates a new one. |
+
+## Verification layers
+
+Beyond the embedding search, four independent checks guard every result:
+
+- **Order consistency** -- the Quran's ayah order is fixed; a placement that contradicts confirmed neighbors is demoted, never silently kept.
+- **Al-Fatiha decoys** (`mask_fatiha`) -- for prayer recordings.
+- **Boundary refinement** (`refine`) -- word-level start/end times transferred from ~7 reference reciters replace loudness-based edges (recovers soft opening words; splits ayah pairs recited without a pause). Each entry reports `refine_mad_ms`, how closely the references agreed.
+- **Mutashabihat duel** (`refine`) -- `mutashabihat.json` (built once from the Quran's text by `mutashabihat/build_mutashabihat.py`, 1,887 pairs Quran-wide) lists every ayah's near-identical rivals and where they differ. For those ayahs the differing word's audio is compared against both candidates' reference recordings: a decisive rival win rejects the crop naming the true ayah; a close call is flagged `verify_by_ear`; it never guesses.
+
+Boundary refinement and the duel need `pip install git+https://github.com/FaisaI/tadabur-align`.
 
 ## How it works, briefly
 
