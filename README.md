@@ -91,11 +91,12 @@ How to read it:
 
 ## 📄 Licenses
 
-| Component                                                            | License                                  |
-| -------------------------------------------------------------------- | ---------------------------------------- |
-| This code                                                            | MIT                                      |
-| [tadabur-embedding](https://huggingface.co/FaisaI/tadabur-embedding) | CC BY-NC 4.0                             |
-| [quran-align](https://github.com/cpfair/quran-align) timestamps      | MIT                                |
-| Reference audio ([everyayah.com](https://everyayah.com))             | fetched at build time, not redistributed |
+| Component                                                                                          | License                                  |
+| -------------------------------------------------------------------------------------------------- | ---------------------------------------- |
+| This code                                                                                          | MIT                                      |
+| [tadabur-embedding](https://huggingface.co/FaisaI/tadabur-embedding)                               | CC BY-NC 4.0                             |
+| [tadabur-align-references](https://huggingface.co/datasets/FaisaI/tadabur-align-references) (reference features and word timestamps, fetched at runtime) | CC BY-NC 4.0 |
+| Reference audio ([everyayah.com](https://everyayah.com))                                           | fetched at build time, not redistributed |
+| Recitation segmenter ([obadx/recitation-segmenter-v2](https://huggingface.co/obadx/recitation-segmenter-v2)) | see model card                   |
 
-Part of the tadabur family: [dataset](https://huggingface.co/datasets/FaisaI/tadabur) · [embedding](https://huggingface.co/FaisaI/tadabur-embedding) · [align](https://github.com/FaisaI/tadabur-align) · this cropper.
+Part of the tadabur family: [dataset](https://huggingface.co/datasets/FaisaI/tadabur) · [embedding](https://huggingface.co/FaisaI/tadabur-embedding) · [align](https://github.com/fherran/tadabur-align) · this cropper.
