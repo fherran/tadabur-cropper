@@ -32,6 +32,8 @@ result.save("out/")
 
 Ayah selection: `ayahs=[...]` for an explicit list, `ayah_start`/`ayah_end` for a range, or neither for the whole surah.
 
+Surah numbers: `surah` is the surah's number (1-114). If you are not sure of a number, read [`surah_index.json`](surah_index.json) in the repo root: one entry per surah with `surah_id`, the English and Arabic names, and `totalAyah`.
+
 ## What you get back
 
 One entry per ayah, in `result` and in `out/manifest.json`, plus one `.wav` per confident ayah (cut from the original file at full quality):
@@ -77,7 +79,7 @@ How to read it:
 
 | Argument | What it means |
 |---|---|
-| `audio_path`, `surah` | The file and its surah number. |
+| `audio_path`, `surah` | The file and its surah number (1-114; see `surah_index.json` for names). |
 | `ayahs` or `ayah_start`/`ayah_end` | Which ayahs; omit for the whole surah. |
 | `canon_text` | Verse text if you have it; `None` fetches it. |
 | `pace_hints`, `pairs_jsonl` | Per-ayah pacing data; defaults auto-download it. |

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "tadabur-cropper"
 version = "0.1.0"
-description = "Crop individual ayahs out of a Quran recitation recording - audio-text embedding search with reference-based verification"
+description = "Crop individual ayahs out of a Quran recitation recording - the reciter's stops, read with word-range alignment"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -20,6 +20,7 @@ dependencies = [
     "certifi",
     "huggingface_hub",
     "recitations-segmenter",
+    "scipy",
     "tadabur-align @ git+https://github.com/FaisaI/tadabur-align",
 ]
 

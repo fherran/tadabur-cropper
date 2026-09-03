@@ -29,6 +29,8 @@ CKPT_REPO = 'FaisaI/tadabur-embedding'
 CKPT_FILENAME = 'checkpoint_last.pt'
 PAIRS_JSONL_REPO = 'FaisaI/tadabur-align-references'
 PAIRS_JSONL_FILENAME = 'aligner_pairs.jsonl'
+MAX_SEQ_FANOUT = 6
+SEGMENTER_REPO = 'obadx/recitation-segmenter-v2'
 MUTASHABIHAT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mutashabihat', 'mutashabihat.json')
 _mutashabihat_cache = None
 
@@ -187,6 +189,9 @@ class AyahCropper:
         self.min_dur = min_dur
         self.verbose = verbose
         self._refiner = None
+        self._segmenter = None
+        self._rstack = {}
+        self._stops_cache = {}
         if torch.cuda.is_available():
             torch.backends.cuda.matmul.allow_tf32 = False
             torch.backends.cudnn.allow_tf32 = False
@@ -255,19 +260,566 @@ class AyahCropper:
             batch = torch.stack(mels)[:, None].to(self.device)
             return self.audio_model.semantic_embedding(batch).cpu()
 
-    def _snap_to_silence(self, wave, total, s, e, max_ext=1.5):
-        hop = 0.025
-        env = wave[0][:int(total / hop) * int(hop * SR)].reshape(-1, int(hop * SR)).pow(2).mean(1).sqrt()
-        quiet = (env < 0.04 * env.max()).numpy()
+    def _align_by_stops(self, audio_path, wave, total, surah, ayahs, prep, api, pad=0.30, span_score=None):
+        """Main path. The reciter marks the boundaries himself by stopping, so
+        take his stops as the only candidate cuts and ask, at each one, how far
+        into the current ayah we have got. When its last word is reached the
+        ayah is done. Nothing here has to guess where a cut belongs."""
+        stops = self._merge_false_stops(wave, total, self._segment_stops(audio_path))
+        if len(stops) < 2:
+            self._log(f'  only {len(stops)} speech span(s) -- nothing to walk')
+            return None
+        # an ayah with too few clean reference alignments cannot be scored,
+        # but it must not sink the whole run: it takes one span and is flagged
+        wc, ref_of, unscorable = {}, {}, set()
+        for a in ayahs:
+            try:
+                ref_of[a] = api._references(surah, a)
+                wc[a] = len(next(iter(ref_of[a].values()))['words'])
+            except Exception as ex:
+                unscorable.add(a)
+                self._log(f'  ayah {a}: no usable references ({ex}) -- will take one span, flagged')
+        if len(unscorable) > len(ayahs) // 3:
+            return None
+
+        fcache, ccache = {}, {}
+        def feats(lo, hi):
+            key = (round(lo, 2), round(hi, 2))
+            if key not in fcache:
+                fcache[key] = self._feats(api, wave, lo, hi)
+            return fcache[key]
+
+        def rcost(lo, hi, a, j, k):
+            key = (round(lo, 2), round(hi, 2), a, j, k)
+            if key not in ccache:
+                ccache[key] = self._range_cost(api, feats(lo, hi), ref_of[a], j, k)
+            return ccache[key]
+
+        # which stop begins the first requested ayah? Anything before it
+        # (isti'adha, basmala, takbir) simply scores badly for its words.
+        a0 = ayahs[0]
+        # WHERE does the passage begin? A prayer recording opens with
+        # al-Fatiha, and the first requested ayah may be a single short word
+        # (36:1 is يس) that scores about the same against anything. So anchor on
+        # the most distinctive of the first few ayahs -- the one with the most
+        # words -- shortlist the spans where IT may sit (one short word can
+        # match anywhere, so no single span is trusted), then try the spans
+        # just before each and keep the start that reads the opening ayahs best.
+        head = [a for a in ayahs if a not in unscorable][:3]
+        if not head:
+            return None
+        anchor = max(head, key=lambda a: wc[a])
+        scan = [i for i in range(len(stops)) if stops[i][1] - stops[i][0] >= 0.8]
+        # a coarse read is enough to shortlist: a few word counts per span,
+        # not every one -- the probe below reads the shortlist exactly
+        ks = sorted({max(1, round(wc[anchor] * f)) for f in (0.25, 0.5, 0.75, 1.0)})
+        a_cost = [(min(rcost(*stops[i], anchor, 1, k) for k in ks), i) for i in scan]
+        a_cost.sort()
+
+        readable = [a for a in ayahs if a not in unscorable]
+
+        def probe(i0):
+            """mean cost of reading the passage from span i0, a few spans deep"""
+            tot, cnt, ptr, ai, i = 0.0, 0, 1, 0, i0
+            while ai < len(readable) and i < len(stops) and cnt < 8:
+                a = readable[ai]
+                lo, hi = stops[i]
+                if hi - lo < 0.3:
+                    i += 1
+                    continue
+                c, k = min(((rcost(lo, hi, a, ptr, k), k) for k in range(ptr, wc[a] + 1)), key=lambda t: t[0])
+                tot += c
+                cnt += 1
+                if k >= wc[a]:
+                    ai += 1
+                    ptr = 1
+                else:
+                    ptr = k + 1
+                i += 1
+            # compared on equal footing: a start so late that the recording
+            # runs out averages fewer readings, and cannot compete with one
+            # that reads the full budget
+            if ai >= len(readable):
+                cnt = 8   # read the whole passage: a full budget's worth
+            return (-cnt, tot / max(cnt, 1)) if ai > 0 else (0, 1e9)
+
+        tried, best = set(), None
+        for _, j in a_cost[:5]:
+            for i0 in range(max(0, j - 4), j + 1):
+                if i0 not in tried:
+                    tried.add(i0)
+                    pc = probe(i0)
+                    if best is None or pc < best[0]:
+                        best = (pc, i0)
+        start_i = best[1]
+        self._log('  start candidates: ' + ', '.join(f'{stops[i][0]:.1f}s={c[1]:.3f}' for c, i in
+                                                     sorted((probe(i0), i0) for i0 in tried)[:6]))
+
+        def refdur(a, j, k):
+            """how long words j..k of ayah a take the reference reciters"""
+            ds = [e['words'][k - 1][1] - e['words'][j - 1][0] for e in ref_of[a].values()]
+            return float(np.median(ds)) if ds else 1.0
+
+        # results[ayah] = [start, end, cost, starts_at_span_edge, ends_at_span_edge]
+        def walk(start_i):
+            """read the passage from this span; returns (results, flags, cost per second)"""
+            results, flags, ai, ptr, seg_i, csum, dsum = {}, {}, 0, 1, start_i, 0.0, 0.0
+            while ai < len(ayahs) and seg_i < len(stops):
+                ayah = ayahs[ai]
+                lo, hi = stops[seg_i]
+                if ayah in unscorable:
+                    results[ayah] = [lo, hi, 1.0, True, True]
+                    self._log(f'  ayah {ayah}: took the span [{lo:.2f},{hi:.2f}] unscored (no references)')
+                    seg_i, ai, ptr = seg_i + 1, ai + 1, 1
+                    continue
+                if hi - lo < 0.25:
+                    seg_i += 1
+                    continue
+                self._head_repeat = None
+                segs = self._read_span(lo, hi, ai, ptr, ayahs, wc, ref_of, unscorable, rcost, refdur, wave, total)
+                if self._head_repeat:
+                    flags[self._head_repeat[0]] = f'may_open_with_repeat_of_ayah_{self._head_repeat[1]}_verify_by_ear'
+                for a_idx, s0, e0, j0, k, kind in segs:
+                    a = ayahs[a_idx]
+                    if kind == 'repeat':
+                        # the reciter said these words again: they stay with their ayah
+                        if a in results:
+                            results[a][1], results[a][4] = e0, e0 >= hi - 1e-6
+                        flags[a] = 'repeated_phrase_verify_by_ear'
+                        self._log(f'    [{s0:.2f},{e0:.2f}] repeats the end of ayah {a} -- kept with it')
+                        continue
+                    n = wc[a]
+                    if a not in results:
+                        results[a] = [s0, e0, 0.0, s0 <= lo + 1e-6, e0 >= hi - 1e-6]
+                    else:
+                        results[a][1], results[a][4] = e0, e0 >= hi - 1e-6
+                    c = rcost(s0, e0, a, j0, k)
+                    results[a][2] = max(results[a][2], c)
+                    csum, dsum = csum + c * (e0 - s0), dsum + (e0 - s0)
+                    self._log(f'  ayah {a}: [{s0:.2f},{e0:.2f}] holds words {j0}..{k} of {n}'
+                              + ('' if k >= n else ' -- continues in the next span'))
+                last = [g for g in segs if g[5] != 'repeat'][-1]
+                if last[4] >= wc[ayahs[last[0]]]:
+                    ai, ptr = last[0] + 1, 1
+                else:
+                    ai, ptr = last[0], last[4] + 1
+                seg_i += 1
+
+            return results, flags, csum / max(dsum, 1e-6)
+
+        # when two starts read the opening almost equally well, the whole
+        # passage decides: a wrong start pays for it further on
+        close = [i0 for i0 in tried if probe(i0)[0] == best[0][0] and probe(i0)[1] <= 1.15 * best[0][1]]
+        walks = {i0: walk(i0) for i0 in sorted(set(close) | {start_i}, key=probe)[:4]}
+        # the start that places the most ayahs wins, cost breaking ties; and
+        # if the passage does not fit after the chosen start, that start was
+        # too late, so earlier candidates are read in full as well
+        def choose():
+            return max(walks, key=lambda i: (len(walks[i][0]), -walks[i][2]))
+        start_i = choose()
+        if len(walks[start_i][0]) < len(ayahs):
+            for i0 in [i for i in sorted(tried, key=probe) if i < start_i and i not in walks][:3]:
+                walks[i0] = walk(i0)
+            start_i = choose()
+        if len(walks) > 1:
+            self._log('  full read from each candidate start: ' + ', '.join(
+                f'{stops[i][0]:.1f}s: {len(w[0])} ayahs at {w[2]:.3f}' for i, w in walks.items()))
+        results, flags, _ = walks[start_i]
+        self._log(f'  passage starts at the span at {stops[start_i][0]:.2f}s '
+                  f'({start_i} earlier span(s) are not part of it)')
+        # a cut inside a span sits on the nearest energy dip, which may be a
+        # few tenths of a second from the true seam; aligning the two ayahs
+        # as one piece places it, and is trusted when the references agree
+        from tadabur_align import verify as _verify
+        for a, b in zip(ayahs, ayahs[1:]):
+            if a not in results or b not in results or results[a][4] or a in unscorable or b in unscorable:
+                continue
+            if abs(results[a][1] - results[b][0]) > 1e-6:
+                continue
+            lo_, hi_ = results[a][0], results[b][1]
+            try:
+                _, _, splits, smad = _verify.stitched_stamps(api, wave[:, int(lo_ * SR):int(hi_ * SR)], surah, [a, b])
+            except Exception:
+                continue
+            j = lo_ + splits[0]
+            if smad[0] <= 150 and abs(j - results[a][1]) <= 1.0:
+                self._log(f'    {a}|{b}: cut moved {results[a][1]:.2f} -> {j:.2f} by the pair alignment '
+                          f'(references agree within {smad[0]:.0f}ms)')
+                results[a][1] = results[b][0] = j
+
+        # crop edges. Start: a short lead-in before the segmenter's onset,
+        # never more than part of the gap to the previous span, since a soft
+        # first consonant sits below what the segmenter hears. End: the last
+        # word can fade for a second after the voice seems to stop, so an end
+        # at a span edge follows the audio down to sustained silence, never
+        # less than the usual padding and never into the next span.
+        quiet, hop = self._quiet_mask(wave, total)
+        span_lo = {round(a, 2): i for i, (a, b) in enumerate(stops)}
+        span_hi = {round(b, 2): i for i, (a, b) in enumerate(stops)}
+        for a, r in results.items():
+            if r[3] and round(r[0], 2) in span_lo:
+                i = span_lo[round(r[0], 2)]
+                gap = r[0] - (stops[i - 1][1] if i > 0 else 0.0)
+                r[0] = max(0.0, r[0] - min(0.25, 0.4 * gap))
+            if r[4] and round(r[1], 2) in span_hi:
+                i = span_hi[round(r[1], 2)]
+                limit = min(r[1] + 1.5, stops[i + 1][0] - 0.05 if i + 1 < len(stops) else total, total)
+                f0, f1 = int(r[1] / hop), int(limit / hop)
+                fade = next((t * hop for t in range(f0, f1 - 3) if quiet[t:t + 4].all()), limit)
+                r[1] = min(limit, max(r[1] + pad, fade))
+        if len(results) < max(1, len(ayahs) // 2):
+            self._log(f'  stop-based pass only completed {len(results)}/{len(ayahs)} ayahs -- falling back')
+            return None
+
+        entries = []
+        for ayah in ayahs:
+            if ayah not in results:
+                entries.append(AyahResult(ayah, prep[ayah]['text'], None, None, False, 'none', 0.0, 0.0, 0.0,
+                                          ['not_found_in_stops']))
+                continue
+            st, en, cost = results[ayah][:3]
+            warns = ['no_reference_verify_by_ear'] if ayah in unscorable else (
+                [] if cost <= 0.65 else ['weak_word_match_verify_by_ear'])
+            if ayah in flags:
+                warns.append(flags[ayah])
+            entries.append(AyahResult(ayah, prep[ayah]['text'], round(st, 3), round(en, 3), True,
+                                      'stops', round(float(cost), 4), 0.0, 0.0, warns))
+        self._log(f'done: {len(results)}/{len(ayahs)} by the stops the reciter made')
+        return CropResult(entries, wave, SR, surah, audio_path)
+
+    def _merge_false_stops(self, wave, total, stops):
+        """A stop the segmenter reports is real only if the audio is actually
+        quiet in the gap. A sustained final vowel can come back as two spans
+        with a 'pause' between them that the energy never shows."""
+        quiet, hop = self._quiet_mask(wave, total)
+        out = []
+        for lo, hi in stops:
+            if out and not quiet[int(out[-1][1] / hop):int(lo / hop) + 1].any():
+                self._log(f'  no silence in the gap {out[-1][1]:.2f}-{lo:.2f}: not a stop, spans merged')
+                out[-1] = (out[-1][0], hi)
+            else:
+                out.append((lo, hi))
+        return out
+
+    def _energy_dips(self, wave, total, lo, hi, hop=0.025, prominence=0.06, min_gap=0.6):
+        """Prominent energy minima inside [lo, hi]: where the reciter softened
+        without stopping outright. The segmenter reports full stops; these are
+        the quieter transitions it does not mark."""
+        try:
+            from scipy.signal import find_peaks
+        except Exception:
+            return []
+        env = wave[0][:int(total / hop) * int(hop * SR)].reshape(-1, int(hop * SR)).pow(2).mean(1).sqrt().numpy()
+        sm = np.convolve(env, np.ones(5) / 5, mode='same')
+        i0, i1 = int((lo + 0.4) / hop), int((hi - 0.4) / hop)
+        if i1 - i0 < 8:
+            return []
+        pk, props = find_peaks(-sm[i0:i1], prominence=prominence, distance=int(min_gap / hop))
+        top = sorted(zip(props['prominences'], pk), reverse=True)[:8]
+        return sorted((i0 + int(k)) * hop for _, k in top)
+
+    def _read_span(self, lo, hi, ai, ptr, ayahs, wc, ref_of, unscorable, rcost, refdur, wave, total):
+        """Faisal's consume loop at dip level. A span is a run of pieces cut
+        at the reciter's energy dips; it may hold the rest of one ayah, or
+        several whole ayahs and the start of the next. Every way of laying the coming ayahs
+        over the pieces is scored -- each piece must be the words it claims
+        to be, and words that are not there or left out both cost -- and the
+        cheapest reading wins. 'One ayah, no cut' is simply the one-piece
+        reading, so a cut is made only where it explains the audio better.
+        Returns [(ayah_index, start, end, first_word, last_word, kind)]."""
+        cuts = [t for t in self._energy_dips(wave, total, lo, hi) if lo + 0.3 < t < hi - 0.3]
+        P = [lo] + sorted(cuts) + [hi]
+        np_ = len(P) - 1
+        cand = []
+        for m in range(4):
+            if ai + m >= len(ayahs) or ayahs[ai + m] in unscorable:
+                break
+            cand.append(ai + m)
+
+        def plausible(d, a, j, k):
+            r = refdur(a, j, k)
+            return 0.3 * r <= d <= 3.5 * r + 0.5
+
+        INF = float('inf')
+        best = {(0, 0): (0.0, [])}   # (piece, ayahs completed) -> (sum cost*dur, segments)
+        for j in range(np_):
+            for m in range(len(cand)):
+                if (j, m) not in best:
+                    continue
+                base, path = best[(j, m)]
+                a = ayahs[cand[m]]
+                j0, n = (ptr if m == 0 else 1), wc[a]
+                for j2 in range(j + 1, np_ + 1):
+                    d = P[j2] - P[j]
+                    if not plausible(d, a, j0, n):
+                        continue
+                    c = base + rcost(P[j], P[j2], a, j0, n) * d
+                    seg = path + [(cand[m], P[j], P[j2], j0, n, 'full')]
+                    if c < best.get((j2, m + 1), (INF, None))[0]:
+                        best[(j2, m + 1)] = (c, seg)
+        final = (INF, None)
+        for m in range(1, len(cand) + 1):
+            if (np_, m) in best and best[(np_, m)][0] < final[0]:
+                final = best[(np_, m)]
+        # the last ayah may be unfinished at the span end
+        for m in range(len(cand)):
+            a = ayahs[cand[m]]
+            j0, n = (ptr if m == 0 else 1), wc[a]
+            for j in range(np_):
+                if (j, m) not in best:
+                    continue
+                base, path = best[(j, m)]
+                d = P[np_] - P[j]
+                ks = sorted({j0 + round((n - 1 - j0) * f) for f in (0.0, 0.25, 0.5, 0.75)} & set(range(j0, n)))
+                if not ks:
+                    continue
+                kc, kb = min((rcost(P[j], P[np_], a, j0, k), k) for k in ks)
+                for k in range(max(j0, kb - 2), min(n - 1, kb + 2) + 1):
+                    c = rcost(P[j], P[np_], a, j0, k)
+                    if c < kc:
+                        kc, kb = c, k
+                if not (j == 0 and m == 0) and not plausible(d, a, j0, kb):
+                    continue
+                c = base + kc * d
+                if c < final[0]:
+                    final = (c, path + [(cand[m], P[j], P[np_], j0, kb, 'partial')])
+        if final[1] is None:
+            a = ayahs[cand[0]]
+            kc, kb = min((rcost(lo, hi, a, ptr, k), k) for k in range(ptr, wc[a] + 1))
+            return [(cand[0], lo, hi, ptr, kb, 'partial' if kb < wc[a] else 'full')]
+        if len(final[1]) > 1:
+            self._log(f'  span [{lo:.2f},{hi:.2f}] reads as {len(final[1])} pieces '
+                      f'(per-second cost {final[0] / (hi - lo):.3f})')
+        # a reciter sometimes says the previous ayah's last words again before
+        # going on. Reading that as a rule misfired on murattal reciters, so it
+        # is only pointed out: the first piece sounds more like the previous
+        # ayah's ending than like this ayah's words
+        if ptr == 1 and ai > 0 and ayahs[ai - 1] not in unscorable and len(P) > 2:
+            pa = ayahs[ai - 1]
+            a0 = final[1][0][0]
+            n0 = wc[ayahs[a0]]
+            for e_head in P[1:min(len(P) - 1, 5)]:
+                own = min(rcost(lo, e_head, ayahs[a0], 1, k) for k in range(1, min(n0, 3) + 1))
+                prev = rcost(lo, e_head, pa, max(1, wc[pa] - 2), wc[pa])
+                if prev < 0.8 * own:
+                    self._log(f'    [{lo:.2f},{e_head:.2f}] sounds like the end of ayah {pa} again '
+                              f'({prev:.3f} vs {own:.3f} as ayah {ayahs[a0]}) -- flagged')
+                    self._head_repeat = (ayahs[a0], pa)
+                    break
+        return final[1]
+
+    def _segment_stops(self, audio_path):
+        """Where the reciter actually stops, from the recitation segmenter
+        (obadx/recitation-segmenter-v2). Returns [(start, end)] speech spans."""
+        if self._stops_cache.get(audio_path) is not None:
+            return self._stops_cache[audio_path]
+        try:
+            from recitations_segmenter import segment_recitations, clean_speech_intervals
+            from transformers import AutoFeatureExtractor, AutoModelForAudioFrameClassification
+            if self._segmenter is None:
+                proc = AutoFeatureExtractor.from_pretrained(SEGMENTER_REPO)
+                mdl = AutoModelForAudioFrameClassification.from_pretrained(SEGMENTER_REPO)
+                dt = torch.bfloat16 if self.device == 'cuda' else torch.float32
+                self._segmenter = (proc, mdl.to(self.device, dtype=dt), dt)
+            proc, mdl, dt = self._segmenter
+            x, sr = sf.read(audio_path, dtype='float32', always_2d=True)
+            w = torch.from_numpy(x.T).mean(0, keepdim=True)
+            if sr != SR:
+                w = torchaudio.functional.resample(w, sr, SR)
+            out = segment_recitations([w.squeeze(0)], mdl, proc, device=torch.device(self.device), dtype=dt, batch_size=8)[0]
+            clean = clean_speech_intervals(out.speech_intervals, out.is_complete,
+                                           min_silence_duration_ms=30, min_speech_duration_ms=30,
+                                           pad_duration_ms=30, return_seconds=True)
+            stops = [(float(a), float(b)) for a, b in clean.clean_speech_intervals]
+            self._log(f'  recitation segmenter: {len(stops)} speech spans between stops')
+        except Exception as ex:
+            self._log(f'  recitation segmenter unavailable ({ex}) -- falling back to the search path')
+            stops = []
+        self._stops_cache[audio_path] = stops
+        return stops
+
+    def _feats(self, api, wave, lo, hi):
+        """Target features of [lo, hi], context-stacked once for scoring."""
+        from tadabur_align import dtw as _dtw
+        tc, tf, _ = api._target_features(wave[:, int(lo * SR):int(hi * SR)])
+        return tc, tf, _dtw.prepare(tf)
+
+    def _range_costs(self, api, feats, refs, j, k):
+        """Per-reference DTW cost of the claim 'this audio holds words j..k'."""
+        from tadabur_align import dtw as _dtw
+        ts = feats[2] if len(feats) > 2 else _dtw.prepare(feats[1])
+        costs = []
+        for name, e in refs.items():
+            ident = (name, len(e['words']), round(e['words'][0][0], 3), round(e['words'][-1][1], 3))
+            if ident not in self._rstack:
+                if len(self._rstack) > 64:
+                    self._rstack.clear()
+                rc, rf = api._collapse_ref(e)
+                self._rstack[ident] = (rc, rf, _dtw.prepare(rf))
+            rc, rf, full = self._rstack[ident]
+            st, en = e['words'][j - 1][0], e['words'][k - 1][1]
+            idx = np.flatnonzero((rc >= st - 0.02) & (rc <= en + 0.02))
+            if len(idx) < 5:
+                continue
+            rs = _dtw.prepare_slice(rf, full, int(idx[0]), int(idx[-1]) + 1)
+            costs.append(float(_dtw.dtw_path(_dtw.cost_matrix(rs, ts, prepared=True))[1]))
+        return costs
+
+    def _range_cost(self, api, feats, refs, j, k):
+        """Mean DTW cost of the claim 'this audio holds words j..k' (1-based).
+        Words that are not there are punished, and so are words left out --
+        so the cost has a real minimum instead of always sliding to an answer."""
+        costs = self._range_costs(api, feats, refs, j, k)
+        return float(np.mean(costs)) if costs else 1e9
+
+    def _word_share_ratio(self, api, med, refs):
+        """How the aligned words divide the span, against how the reference
+        reciters divide it. DTW must fill whatever window it is given, so a
+        window cut short squeezes the closing words -- and every reference
+        squeezes with it, which is why agreement cannot see truncation."""
+        prof = []
+        for entry in refs.values():
+            ws = entry['words']
+            tot = ws[-1][1] - ws[0][0]
+            if tot > 0 and len(ws) == len(med):
+                prof.append([(b - a) / tot for a, b in ws])
+        if not prof:
+            return None
+        ref = np.mean(np.array(prof), axis=0)
+        tot = float(med[-1][1] - med[0][0])
+        if tot <= 0:
+            return None
+        got = np.array([float(b - a) / tot for a, b in med])
+        with np.errstate(divide='ignore', invalid='ignore'):
+            return np.where(ref > 0, got / ref, 1.0)
+
+    def _pause_candidates(self, wave, total, hop=0.025, min_run=0.15):
+        """Breaths, measured against the recording's OWN noise floor: room tone
+        sits near a tenth of peak, so a fixed fraction of the maximum finds
+        nothing. Returns [(center, width)] with the speech start/end."""
+        quiet, hop = self._quiet_mask(wave, total, hop)
+        runs, i = [], 0
+        while i < len(quiet):
+            if quiet[i]:
+                j = i
+                while j < len(quiet) and quiet[j]:
+                    j += 1
+                runs.append((i * hop, j * hop))
+                i = j
+            else:
+                i += 1
+        voiced = np.where(~quiet)[0]
+        if len(voiced) == 0:
+            return [], 0.0, total
+        speech_s, speech_e = voiced[0] * hop, (voiced[-1] + 1) * hop
+        merged = []
+        for lo, hi in runs:
+            if merged and lo - merged[-1][1] < 0.15:
+                merged[-1] = (merged[-1][0], hi)
+            else:
+                merged.append([lo, hi])
+        cands = [((lo + hi) / 2, hi - lo) for lo, hi in merged
+                 if hi - lo >= min_run and lo > speech_s + 0.2 and hi < speech_e - 0.2]
+        return cands, speech_s, speech_e
+
+    def _sequential_bounds(self, wave, total, ayahs, prep, no_pause_penalty=0.55, dur_weight=0.3):
+        """Boundaries for a contiguous run that fills the recording. The ayahs
+        are in order, so segment the audio instead of hunting each one: prefer
+        real breaths, weighted by how breath-like they are, and fall back to
+        expected-duration interpolation where none fits -- a waqf is not an
+        ayah end, so a split that makes the durations implausible loses."""
+        cands, speech_s, speech_e = self._pause_candidates(wave, total)
+        exp = np.array([max(prep[a]['exp_dur_raw'], 0.2) for a in ayahs], dtype=float)
+        if exp.sum() <= 0 or speech_e - speech_s < 1.0:
+            return None
+        exp = exp / exp.sum() * (speech_e - speech_s)
+        n = len(ayahs)
+        # option list per boundary: every pause, plus "no pause here"
+        # a wide breath is strong evidence; char-count durations are only a
+        # weak prior, since elongation varies far more than text length
+        opts = [(c, no_pause_penalty * (1.0 - min(w, 0.8) / 0.8)) for c, w in cands]
+
+        # memoised over (ayah index, boundary position) and fanned out only to
+        # pauses near the expected end -- plain recursion over every candidate
+        # is exponential and hangs on a long recording
+        memo = {}
+
+        def solve(k, t0):
+            """(cost, [boundaries]) for ayahs[k:] starting at t0"""
+            key = (k, round(t0, 3))
+            if key in memo:
+                return memo[key]
+            if k == n - 1:
+                out = (dur_weight * abs(np.log(max(speech_e - t0, 0.05) / exp[k])), [])
+                memo[key] = out
+                return out
+            rest = exp[k:].sum()
+            interp = t0 + (speech_e - t0) * exp[k] / rest
+            near = sorted((c for c, _ in opts if t0 + 0.3 < c < speech_e),
+                          key=lambda c: abs(c - (t0 + exp[k])))[:MAX_SEQ_FANOUT]
+            choices = [(c, pen) for c, pen in opts if c in near]
+            choices.append((interp, no_pause_penalty))
+            best = None
+            for t1, pen in choices:
+                if t1 <= t0 or t1 >= speech_e:
+                    continue
+                sub_cost, sub_path = solve(k + 1, t1)
+                c = dur_weight * abs(np.log(max(t1 - t0, 0.05) / exp[k])) + pen + sub_cost
+                if best is None or c < best[0]:
+                    best = (c, [t1] + sub_path)
+            out = best if best else (1e9, [])
+            memo[key] = out
+            return out
+
+        cost, path = solve(0, speech_s)
+        if not path and n > 1:
+            return None
+        bounds = [speech_s] + path + [speech_e]
+        backed = [any(abs(t - c) < 0.15 for c, _ in cands) for t in path]
+        return bounds, backed
+
+    def _quiet_mask(self, wave, total, hop=0.025):
+        """The one definition of silence, measured against the recording's OWN
+        noise floor: room tone and reverb sit near a tenth of peak, so a fixed
+        fraction of the maximum sits BELOW the noise and finds nothing."""
+        env = wave[0][:int(total / hop) * int(hop * SR)].reshape(-1, int(hop * SR)).pow(2).mean(1).sqrt().numpy()
+        floor = float(np.percentile(env, 10))
+        return env < min(max(2.0 * floor, 0.02 * float(env.max())), 0.25 * float(env.max())), hop
+
+    def _snap_to_silence(self, wave, total, s, e, max_ext=1.5, run=4):
+        quiet, hop = self._quiet_mask(wave, total)
 
         def nudge(t, direction):
+            # sustained quiet only: one dipping frame inside a fading tail is
+            # not silence, and the recording's edges are silence by definition
             i = int(t / hop)
             for step in range(int(max_ext / hop)):
                 j = i + direction * step
-                if 0 <= j < len(quiet) and quiet[j]:
+                if j < 0 or j >= len(quiet):
+                    return min(max(0.0, j * hop), total)
+                seg = quiet[j:j + run] if direction > 0 else quiet[max(0, j - run + 1):j + 1]
+                if len(seg) and seg.all():
                     return j * hop
             return t
         return (max(0.0, nudge(s, -1)), min(total, nudge(e, +1)))
+
+    def _nearest_pause(self, wave, total, t, radius=1.2, min_run=0.2):
+        """Centre of the widest sustained pause within radius of t, else None.
+        A boundary the reciter never stopped at is not a boundary."""
+        quiet, hop = self._quiet_mask(wave, total)
+        lo, hi = max(0, int((t - radius) / hop)), min(len(quiet), int((t + radius) / hop))
+        best, i = None, lo
+        while i < hi:
+            if quiet[i]:
+                j = i
+                while j < len(quiet) and quiet[j]:
+                    j += 1
+                if (j - i) * hop >= min_run and (best is None or (j - i) > (best[1] - best[0])):
+                    best = (i, j)
+                i = j
+            else:
+                i += 1
+        return None if best is None else (best[0] + best[1]) / 2 * hop
 
     def _windowed_scores(self, embed_clips, s, e, queries):
         """windowed_similarity scoring for many queries, one embedding pass."""
@@ -280,7 +832,7 @@ class AyahCropper:
         embs = embed_clips([(a, min(e, a + 10.0)) for a in starts])
         return [float((embs @ q).max()) for q in queries]
 
-    def align(self, audio_path, surah, ayahs=None, ayah_start=None, ayah_end=None, canon_text=None, pace_hints=None, pairs_jsonl='auto', quran_api=DEFAULT_QURAN_API, residual_max_span=60.0, residual_max_run=10, mask_fatiha=True, decoy_margin=0.35, refine=True):
+    def align(self, audio_path, surah, ayahs=None, ayah_start=None, ayah_end=None, canon_text=None, pace_hints=None, pairs_jsonl='auto', quran_api=DEFAULT_QURAN_API, residual_max_span=60.0, residual_max_run=10, mask_fatiha=True, decoy_margin=0.35, refine=True, sequential='auto', stops_path=True):
         t0 = time.time()
         if canon_text is None:
             ctx = ssl.create_default_context(cafile=certifi.where())
@@ -340,6 +892,36 @@ class AyahCropper:
             exp_dur = min(exp_dur_raw, 10.24)
             query = self._embed_text(text)
             prep[ayah] = {'text': text, 'exp_dur': exp_dur, 'exp_dur_raw': exp_dur_raw, 'query': query}
+        # MAIN PATH: the reciter's own stops. The search below is the
+        # fallback for when the segmenter is unavailable or cannot complete
+        # the run (a recording that is not one continuous recitation).
+        if stops_path:
+            api_s = None
+            try:
+                from tadabur_align import WordTimestamps
+                if self._refiner is None:
+                    self._refiner = WordTimestamps(device=self.device, min_refs=2)
+                api_s = self._refiner
+            except Exception as ex:
+                self._log(f'  aligner unavailable for the stop path ({ex})')
+            if api_s is not None:
+                try:
+                    q0 = prep[ayahs[0]]['query']
+                    sims0 = (chunk_embs @ q0).numpy()
+
+                    def _span_score(i, _st=None):
+                        a, b = self._stops_cache.get(audio_path, [(0, 0)])[i]
+                        m = (chunk_centers >= a) & (chunk_centers <= b)
+                        return float(sims0[m].max()) if m.any() else -1e9
+                    out = self._align_by_stops(audio_path, wave, total, surah, ayahs, prep, api_s,
+                                               span_score=_span_score)
+                except Exception as ex:
+                    self._log(f'  stop path failed ({ex}) -- falling back to the search')
+                    out = None
+                if out is not None:
+                    self._log(f'total {time.time() - t0:.1f}s')
+                    return out
+
         # in-request rivals, logged only; never arbitrate by embedding score
         # (tried, noise) -- the word duel in refine is the real check
         confusable = {ayah: set() for ayah in ayahs}
@@ -383,6 +965,7 @@ class AyahCropper:
         skipped = []
         # actual/predicted duration ratios: this reciter's observed pace
         pace_ratios = []
+        observed_pace = 1.0
 
         def confirmed_spans():
             return [(r['start'], r['end']) for r in raw_results.values() if r['confident']]
@@ -470,8 +1053,8 @@ class AyahCropper:
             raw_results[ayah] = {'method': 'residual_gap', 'start': s, 'end': e, 'sc': sc, 'open_score': o, 'close_score': c, 'confident': confident, 'warnings': warnings}
             self._log(f'  {"RESOLVED" if confident else "GUESSED (unverified)"} ayah {ayah} at [{s:.2f},{e:.2f}] sc={sc:.3f} ({",".join(warnings)})')
             return confident
+        observed_pace = float(np.median(pace_ratios)) if pace_ratios else 1.0
         if skipped:
-            observed_pace = float(np.median(pace_ratios)) if pace_ratios else 1.0
             self._log(f'  residual pass: observed pace {observed_pace:.2f}x pace_hints prediction (from {len(pace_ratios)} confirmed ayahs so far)')
             gaps = br.find_gaps(confirmed_spans(), total)
             self._log(f'  residual pass: {len(skipped)} skipped, {len(gaps)} unclaimed gaps')
@@ -520,6 +1103,99 @@ class AyahCropper:
                     if not br.overlaps_any(a, b, confirmed_spans()):
                         if _accept_residual(ayah, a, b, sc, 'resolved_by_elimination_last_remaining_ayah'):
                             skipped.remove(ayah)
+        # When the embedding cannot read this recitation (melismatic taraweeh
+        # scores near noise), hunting each ayah separately scatters them. A
+        # contiguous request is a run in order, so segment the audio instead.
+        contiguous = ayahs == list(range(min(ayahs), max(ayahs) + 1))
+        strong_hits = [a for a in ayahs if raw_results.get(a) and raw_results[a]['confident']
+                       and raw_results[a]['sc'] >= self.quality_floor]
+        use_seq = sequential is True or (sequential == 'auto' and contiguous and len(strong_hits) < len(ayahs) / 2)
+        if use_seq and contiguous:
+            seq = self._sequential_bounds(wave, total, ayahs, prep)
+            if seq:
+                bounds, backed = list(seq[0]), list(seq[1])
+                self._log(f'  embedding evidence weak ({len(strong_hits)}/{len(ayahs)} above quality floor) -- '
+                          f'segmenting the run by breaths instead')
+                # a breath is not always an ayah end (the reciter may stop at a
+                # waqf): a clip running far past its OWN words has swallowed the
+                # next ayah, so trim it back to where its words actually end
+                if refine:
+                    try:
+                        from tadabur_align import WordTimestamps
+                        from tadabur_align import verify as ta_verify
+                        if self._refiner is None:
+                            self._refiner = WordTimestamps(device=self.device, min_refs=2)
+                        api_s = self._refiner
+                        for _round in range(2):
+                            grids = {}
+                            for i, ayah in enumerate(ayahs):
+                                lo, hi = bounds[i], bounds[i + 1]
+                                if hi - lo < 0.6:
+                                    continue
+                                try:
+                                    med, mad, _, _, _ = ta_verify.word_stamps(api_s, wave[:, int(lo * SR):int(hi * SR)], surah, ayah)
+                                    grids[i] = (lo + float(med[0][0]), lo + float(med[-1][1]))
+                                except Exception:
+                                    pass
+                            if len(grids) < 3:
+                                break
+                            slack = {i: bounds[i + 1] - we for i, (ws, we) in grids.items()}
+                            typical = float(np.median(list(slack.values())))
+                            moved = False
+                            for i in sorted(grids):
+                                if i >= len(ayahs) - 1:
+                                    continue
+                                we = grids[i][1]
+                                if slack[i] > max(1.0, 3 * max(typical, 0.05)) and we > bounds[i] + 0.5:
+                                    nb = min(we + max(typical, 0.1), bounds[i + 1])
+                                    self._log(f'  ayah {ayahs[i]}: clip runs {slack[i]:.2f}s past its own words '
+                                              f'(typical {typical:.2f}s) -- boundary {bounds[i + 1]:.2f} -> {nb:.2f}')
+                                    bounds[i + 1] = nb
+                                    backed[i] = False
+                                    moved = True
+                            if not moved:
+                                break
+                    except Exception as ex:
+                        self._log(f'  clip-trim pass unavailable ({ex})')
+                entries = []
+                for i, ayah in enumerate(ayahs):
+                    st, en = float(bounds[i]), float(bounds[i + 1])
+                    warns = []
+                    if i > 0 and not backed[i - 1]:
+                        warns.append('start_not_breath_backed_verify_by_ear')
+                    if i < len(ayahs) - 1 and not backed[i]:
+                        warns.append('end_not_breath_backed_verify_by_ear')
+                    self._log(f'  ayah {ayah}: [{st:.2f},{en:.2f}] ({en - st:.2f}s) sequential'
+                              f"{' -- ' + ','.join(warns) if warns else ''}")
+                    entries.append(AyahResult(ayah, prep[ayah]['text'], round(st, 3), round(en, 3),
+                                              True, 'sequential_breaths', 0.0, 0.0, 0.0, warns))
+                self._log(f'done: {len(entries)}/{len(ayahs)} by sequential layout  (total {time.time() - t0:.1f}s)')
+                return CropResult(entries, wave, SR, surah, audio_path)
+
+        # consecutive ayahs of a continuous recitation join up: speech left
+        # orphaned between two of them belongs to the later one, which simply
+        # started too late. Only real speech counts -- a pause is not an orphan
+        for ayah in ayahs:
+            r, nx = raw_results.get(ayah), raw_results.get(ayah + 1)
+            if not (r and nx and r['confident'] and nx['confident']):
+                continue
+            gap = nx['start'] - r['end']
+            if gap <= 1.0:
+                continue
+            try:
+                quiet, hop = self._quiet_mask(wave, total)
+                seg = quiet[int(r['end'] / hop):int(nx['start'] / hop)]
+                voiced_s = float((~seg).sum()) * hop if len(seg) else 0.0
+            except Exception:
+                voiced_s = 0.0
+            if voiced_s < 0.5:
+                continue
+            back = self._nearest_pause(wave, total, r['end'] + 0.05, radius=0.5) or r['end']
+            self._log(f'  ayah {ayah + 1}: {voiced_s:.1f}s of recitation was orphaned after ayah {ayah} '
+                      f'-- start {nx["start"]:.2f} -> {back:.2f}')
+            nx['start'] = back
+            nx['warnings'] = nx['warnings'] + ['start_extended_over_orphaned_audio_verify_by_ear']
+
         # Boundary refinement: word timestamps transferred from reference
         # recitations (tadabur-align) replace loudness-based edges.
         if refine:
@@ -528,7 +1204,7 @@ class AyahCropper:
                 from tadabur_align import WordTimestamps
                 from tadabur_align import verify as ta_verify
                 if self._refiner is None:
-                    self._refiner = WordTimestamps(device=self.device)
+                    self._refiner = WordTimestamps(device=self.device, min_refs=2)
                 api = self._refiner
             except Exception as ex:
                 self._log(f'  refine skipped ({ex})')
@@ -566,6 +1242,94 @@ class AyahCropper:
                             r['start'], r['end'] = self._snap_to_silence(wave, total, r['start'], r['end'])
                             self._log(f'  ayah {ayah}: refined {"+".join(moved)} -> [{r["start"]:.2f},{r["end"]:.2f}] (word agreement {mad.mean():.0f}ms)')
                         r['refine_mad_ms'] = round(float(mad.mean()), 1)
+                        # truncation audit: a reciter may stop at a waqf, and the
+                        # crop then ends mid-ayah while every reference agrees on
+                        # the squeezed layout. Closing words far short of their
+                        # usual share mean the ending was cut off
+                        share = self._word_share_ratio(api, med, own_refs)
+                        # Where does this ayah BEGIN? Same question at the head:
+                        # start too early and the first word stretches over the
+                        # previous ayah's tail, too late and it collapses to zero
+                        pinned_by_prev = bool(prev_r and prev_r.get('_repaired_end') is not None
+                                              and abs(prev_r['_repaired_end'] - r['start']) < 0.05)
+                        if share is not None and not pinned_by_prev:
+                            exp_d0 = prep[ayah]['exp_dur_raw'] * max(observed_pace, 0.5)
+                            floor_t = prev_r['start'] + 0.3 if prev_r else 0.0
+                            cands_h, _, _ = self._pause_candidates(wave, total)
+                            # only a NEARBY stop: a first-word share cannot tell a
+                            # correct start from one seconds late (DTW refits
+                            # either way), so this may correct a spill-over from
+                            # the previous ayah, never relocate the ayah
+                            behind = [c for c, _ in cands_h
+                                      if floor_t < c < r['end'] - 0.35 * exp_d0 and abs(c - r['start']) <= 1.5]
+                            behind.sort(key=lambda c: abs(c - r['start']))
+                            sh_scored = []
+                            for pt in behind[:10]:
+                                try:
+                                    med0, mad0, _, _, _ = ta_verify.word_stamps(api, wave[:, int(pt * SR):int(r['end'] * SR)], surah, ayah)
+                                    sh0 = self._word_share_ratio(api, med0, own_refs)
+                                    if sh0 is None:
+                                        continue
+                                    sh_scored.append((abs(np.log(max(sh0[0], 1e-3))) + float(mad0.mean()) / 300.0, pt, float(sh0[0]), float(mad0.mean())))
+                                except Exception:
+                                    continue
+                            if sh_scored:
+                                sh_scored.sort()
+                                _, pt0, s0_v, m0_v = sh_scored[0]
+                                if abs(pt0 - r['start']) >= 0.2 and 0.6 <= s0_v <= 1.5 and m0_v <= 200:
+                                    self._log(f'  ayah {ayah}: begins at the stop at {pt0:.2f} (first word {s0_v:.2f} of its usual share, '
+                                              f'agreement {m0_v:.0f}ms) -- was {r["start"]:.2f}')
+                                    r['start'] = pt0
+                                    r['_edge'] = (pt0, r['_edge'][1])
+                                    r['_repaired_start'] = pt0
+                                    if prev_r and prev_r['end'] > pt0:
+                                        prev_r['end'] = pt0
+                                        prev_r['warnings'] = prev_r['warnings'] + ['end_moved_by_neighbour_verify_by_ear']
+
+                        # Where does this ayah actually end? The reciter's own
+                        # stops are the only candidate cuts, and at each one the
+                        # question is answerable: too short and the closing words
+                        # are squeezed, too long and the last word stretches into
+                        # the next ayah, right and the profile matches the
+                        # references with their best agreement.
+                        if share is not None:
+                            exp_d = prep[ayah]['exp_dur_raw'] * max(observed_pace, 0.5)
+                            room = min(total, next_r['end'] if next_r else total)
+                            cands_p, _, _ = self._pause_candidates(wave, total)
+                            ahead = [c for c, _ in cands_p
+                                     if r['start'] + 0.35 * exp_d < c < min(room - 0.2, r['start'] + 3.5 * exp_d)]
+                            # nearest the EXPECTED ending, not the first few in
+                            # time: a slow reciter's true end can sit many stops
+                            # further on, and a chronological cap never sees it
+                            ahead.sort(key=lambda c: abs(c - (r['start'] + exp_d)))
+                            scored = []
+                            for pt in ahead[:14]:
+                                try:
+                                    med2, mad2, _, _, _ = ta_verify.word_stamps(api, wave[:, int(r['start'] * SR):int((pt + 0.25) * SR)], surah, ayah)
+                                    sh2 = self._word_share_ratio(api, med2, own_refs)
+                                    if sh2 is None:
+                                        continue
+                                    # agreement carries real weight: a garbled
+                                    # alignment can produce any share profile
+                                    scored.append((abs(np.log(max(sh2[-1], 1e-3))) + float(mad2.mean()) / 300.0, pt, float(sh2[-1]), float(mad2.mean())))
+                                except Exception:
+                                    continue
+                            if scored:
+                                scored.sort()
+                                cost_v, pt, sh_v, mad_v = scored[0]
+                                if abs(pt - r['end']) >= 0.2 and 0.6 <= sh_v <= 1.5 and mad_v <= 200:
+                                    self._log(f'  ayah {ayah}: ends at the stop at {pt:.2f} (closing word {sh_v:.2f} of its usual share, '
+                                              f'agreement {mad_v:.0f}ms) -- was {r["end"]:.2f}')
+                                    r['end'] = pt
+                                    r['_edge'] = (r['_edge'][0], pt)
+                                    r['_repaired_end'] = pt
+                                    if next_r and next_r['start'] < pt:
+                                        next_r['start'] = pt
+                                        next_r['warnings'] = next_r['warnings'] + ['start_moved_by_neighbour_verify_by_ear']
+                                        self._log(f'    ayah {ayah + 1}: start pushed to {pt:.2f} (it held the previous ending)')
+                                elif not (0.6 <= sh_v <= 1.5):
+                                    r['warnings'] = r['warnings'] + ['ending_uncertain_verify_by_ear']
+                                    self._log(f'  ayah {ayah}: no stop completes this ayah cleanly (best {sh_v:.2f} share at {pt:.2f}) -- verify by ear')
                         if mad.mean() > 250:
                             r['warnings'] = r['warnings'] + ['weak_word_agreement_verify_by_ear']
                         verdicts = ta_verify.word_duel(api, med, tc2, tf2, own_refs, _load_mutashabihat().get(f'{surah}:{ayah}', {}))
@@ -666,19 +1430,19 @@ class AyahCropper:
                         med, mad, splits, smad = ta_verify.stitched_stamps(api, wave[:, int(lo * SR):int(hi * SR)], surah, chain)
                         prev_n = raw_results.get(chain[0] - 1)
                         next_n = raw_results.get(chain[-1] + 1)
-                        if mad[0, 0] <= 150:
-                            s_new = max(lo, lo + med[0, 0] - 0.06)
-                            if prev_n:
-                                s_new = max(s_new, min(r_first['start'], prev_n['end']))
-                            r_first['start'] = s_new
-                        if mad[-1, 1] <= 150:
-                            e_new = min(hi, lo + med[-1, 1] + 0.1)
-                            if next_n:
-                                e_new = min(e_new, max(r_last['end'], next_n['start']))
-                            r_last['end'] = e_new
+                        # the chain's OUTER edges are left alone on purpose: a
+                        # four-ayah fit pins its middle and lets its two ends
+                        # slide, and the single-ayah pass measured them tighter
+
                         for k, sp in enumerate(splits):
                             aa, bb = chain[k], chain[k + 1]
                             ra, rb = raw_results[aa], raw_results[bb]
+                            # a boundary restored from a waqf truncation was
+                            # proved against a pause and the word profile; this
+                            # pass knows neither, so it may not move it back
+                            if ra.get('_repaired_end') is not None or rb.get('_repaired_start') is not None:
+                                self._log(f'  boundary {aa}|{bb}: left at {ra["end"]:.2f} (restored ending, not re-litigated)')
+                                continue
                             pa = (ra.get('_edge') or (None, None))[1]
                             pb = (rb.get('_edge') or (None, None))[0]
                             cands_ = []
