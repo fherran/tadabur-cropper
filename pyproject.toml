@@ -21,7 +21,7 @@ dependencies = [
     "huggingface_hub",
     "recitations-segmenter",
     "scipy",
-    "tadabur-align @ git+https://github.com/FaisaI/tadabur-align",
+    "tadabur-align @ git+https://github.com/fherran/tadabur-align",
 ]
 
 [project.urls]
